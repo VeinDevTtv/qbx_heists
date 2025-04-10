@@ -1,5 +1,9 @@
 -- Events file for handling heist-related client events
 local QBX = exports['qbx_core']:GetCoreObject()
+local activeHeist = nil
+local currentStage = 0
+local heistBlips = {}
+local objectiveMarkers = {}
 
 -- Common function to handle minigames with different difficulty levels based on heist type
 local function HandleMinigame(data, minigameType)
@@ -685,4 +689,359 @@ RegisterCommand('heistinfo', function()
     -- Show heist info
     QBX.Functions.Notify('Current Heist: ' .. heistData.name, 'primary')
     QBX.Functions.Notify('Stage: ' .. heistData.stage .. '/3', 'primary')
-end, false) 
+end, false)
+
+-- Event triggered when a player joins a heist
+RegisterNetEvent('qbx_heists:client:JoinHeist', function(heistData)
+    activeHeist = heistData
+    currentStage = 1
+    
+    -- Display notification
+    lib.notify({
+        title = 'Heist Joined',
+        description = string.format('You joined a %s heist', heistData.type),
+        type = 'success'
+    })
+    
+    -- Create objective markers and blips
+    CreateHeistBlips()
+    SetupObjectiveMarkers()
+    
+    -- Start tracking progress
+    StartHeistTracking()
+end)
+
+-- Event triggered when a heist is completed
+RegisterNetEvent('qbx_heists:client:HeistCompleted', function(rewards)
+    -- Clear active heist data
+    ClearHeistData()
+    
+    -- Display reward notification
+    lib.notify({
+        title = 'Heist Completed',
+        description = string.format('You earned $%s', rewards.money),
+        type = 'success'
+    })
+    
+    -- Add rewards animation/sound
+    PlaySoundFrontend(-1, "PICK_UP", "HUD_FRONTEND_DEFAULT_SOUNDSET", 1)
+    
+    -- Trigger laptop app update
+    TriggerEvent('qbx_laptop:client:updateHeistData')
+end)
+
+-- Event triggered when a heist stage is completed
+RegisterNetEvent('qbx_heists:client:StageCompleted', function(stageNum, nextStage)
+    -- Update current stage
+    currentStage = stageNum + 1
+    
+    -- Display notification
+    lib.notify({
+        title = 'Stage Completed',
+        description = string.format('Moving to stage %s: %s', currentStage, nextStage.name),
+        type = 'success'
+    })
+    
+    -- Update objective markers
+    ClearObjectiveMarkers()
+    SetupObjectiveMarkers()
+    
+    -- Play success sound
+    PlaySoundFrontend(-1, "Mission_Pass_Notify", "DLC_HEISTS_GENERAL_FRONTEND_SOUNDS", 1)
+end)
+
+-- Event triggered when a heist is failed
+RegisterNetEvent('qbx_heists:client:HeistFailed', function(reason)
+    -- Clear active heist data
+    ClearHeistData()
+    
+    -- Display failure notification
+    lib.notify({
+        title = 'Heist Failed',
+        description = reason,
+        type = 'error'
+    })
+    
+    -- Play failure sound
+    PlaySoundFrontend(-1, "Fail", "DLC_HEISTS_GENERAL_FRONTEND_SOUNDS", 1)
+    
+    -- Trigger laptop app update
+    TriggerEvent('qbx_laptop:client:updateHeistData')
+end)
+
+-- Event triggered when a heist is canceled
+RegisterNetEvent('qbx_heists:client:HeistCanceled', function()
+    -- Clear active heist data
+    ClearHeistData()
+    
+    -- Display cancellation notification
+    lib.notify({
+        title = 'Heist Canceled',
+        description = 'The heist has been canceled',
+        type = 'primary'
+    })
+    
+    -- Trigger laptop app update
+    TriggerEvent('qbx_laptop:client:updateHeistData')
+end)
+
+-- Event for police alerts
+RegisterNetEvent('qbx_heists:client:PoliceAlert', function(coords, heistType)
+    -- Only trigger for police officers
+    local PlayerData = QBX.Functions.GetPlayerData()
+    if PlayerData.job.name ~= 'police' or not PlayerData.job.onduty then return end
+    
+    -- Display notification
+    lib.notify({
+        title = 'Heist Alert',
+        description = string.format('Possible %s in progress', heistType),
+        type = 'inform'
+    })
+    
+    -- Create alert blip
+    local blip = AddBlipForCoord(coords.x, coords.y, coords.z)
+    SetBlipSprite(blip, 161) -- Robbery blip sprite
+    SetBlipColour(blip, 1) -- Red
+    SetBlipAsShortRange(blip, false)
+    SetBlipScale(blip, 1.2)
+    BeginTextCommandSetBlipName("STRING")
+    AddTextComponentString("Heist in Progress")
+    EndTextCommandSetBlipName(blip)
+    
+    -- Flash blip
+    SetBlipFlashes(blip, true)
+    
+    -- Remove blip after 60 seconds
+    Citizen.SetTimeout(60000, function()
+        RemoveBlip(blip)
+    end)
+    
+    -- Add route to the location
+    SetNewWaypoint(coords.x, coords.y)
+end)
+
+-- Event for syncing heist timers
+RegisterNetEvent('qbx_heists:client:SyncTimer', function(startTime, endTime)
+    if not activeHeist then return end
+    
+    activeHeist.startTime = startTime
+    activeHeist.endTime = endTime
+    
+    -- Update any UI elements displaying time
+end)
+
+-- Event for objective updates
+RegisterNetEvent('qbx_heists:client:UpdateObjective', function(objectiveId, status)
+    if not activeHeist then return end
+    
+    -- Find and update the objective
+    for i, objective in ipairs(activeHeist.stages[currentStage].objectives) do
+        if objective.id == objectiveId then
+            objective.status = status
+            
+            -- Update any UI elements
+            break
+        end
+    end
+    
+    -- If all objectives are complete, check if stage should advance
+    CheckStageProgression()
+end)
+
+-- Event for updating gang territories (integration with qbx_graffiti)
+RegisterNetEvent('qbx_heists:client:UpdateTerritories', function(territories)
+    -- Update territory data in local state
+    exports['qbx_heists']:SetTerritories(territories)
+    
+    -- Refresh any UI elements displaying territory information
+    TriggerEvent('qbx_laptop:client:refreshTerritories')
+end)
+
+-- Event for displaying minigame
+RegisterNetEvent('qbx_heists:client:StartMinigame', function(minigameType, difficulty, callback)
+    -- Handle different minigame types
+    if minigameType == 'lockpick' then
+        exports['lockpick']:StartLockpick(difficulty, function(success)
+            if callback then
+                TriggerEvent(callback, success)
+            end
+        end)
+    elseif minigameType == 'hacking' then
+        exports['hacking']:StartHackingGame(difficulty, function(success)
+            if callback then
+                TriggerEvent(callback, success)
+            end
+        end)
+    elseif minigameType == 'thermite' then
+        exports['thermite']:StartThermiteGame(difficulty, function(success)
+            if callback then
+                TriggerEvent(callback, success)
+            end
+        end)
+    elseif minigameType == 'voltlab' then
+        exports['ultra-voltlab']:StartGame(function(result)
+            if callback then
+                TriggerEvent(callback, result)
+            end
+        end)
+    elseif minigameType == 'bolt' then
+        local time = difficulty == 'easy' and 10 or (difficulty == 'medium' and 7 or 5)
+        exports['ls_bolt_minigame']:StartMinigame(time, function(result)
+            if callback then
+                TriggerEvent(callback, result)
+            end
+        end)
+    end
+end)
+
+-- Helper functions
+function CreateHeistBlips()
+    if not activeHeist then return end
+    
+    -- Create blip for heist location
+    local blip = AddBlipForCoord(activeHeist.location.x, activeHeist.location.y, activeHeist.location.z)
+    SetBlipSprite(blip, 161) -- Robbery blip sprite
+    SetBlipColour(blip, 5) -- Yellow
+    SetBlipAsShortRange(blip, true)
+    SetBlipScale(blip, 1.0)
+    BeginTextCommandSetBlipName("STRING")
+    AddTextComponentString(activeHeist.type .. " Heist")
+    EndTextCommandSetBlipName(blip)
+    
+    table.insert(heistBlips, blip)
+end
+
+function SetupObjectiveMarkers()
+    if not activeHeist or not activeHeist.stages[currentStage] then return end
+    
+    for _, objective in ipairs(activeHeist.stages[currentStage].objectives) do
+        -- Only create markers for objectives that have positions and aren't completed
+        if objective.position and objective.status ~= 'completed' then
+            -- Create marker
+            local markerId = CreateMarker(
+                2, -- Type: ChevronUpCircle
+                objective.position.x, 
+                objective.position.y, 
+                objective.position.z, 
+                0.0, 0.0, 0.0, -- Dir
+                0.0, 0.0, 0.0, -- Rot
+                1.0, 1.0, 1.0, -- Scale
+                100, 255, 100, 100, -- Color (RGBA)
+                false, -- Bob
+                false, -- Face camera
+                2, -- p19
+                false, -- Rotate
+                nil, -- Texture dictionary
+                nil, -- Texture name
+                false -- Draw on entities
+            )
+            
+            table.insert(objectiveMarkers, {
+                id = markerId,
+                objectiveId = objective.id,
+                position = objective.position
+            })
+        end
+    end
+end
+
+function ClearObjectiveMarkers()
+    for _, marker in ipairs(objectiveMarkers) do
+        DeleteMarker(marker.id)
+    end
+    objectiveMarkers = {}
+end
+
+function ClearHeistBlips()
+    for _, blip in ipairs(heistBlips) do
+        RemoveBlip(blip)
+    end
+    heistBlips = {}
+end
+
+function ClearHeistData()
+    activeHeist = nil
+    currentStage = 0
+    ClearHeistBlips()
+    ClearObjectiveMarkers()
+    StopHeistTracking()
+end
+
+function StartHeistTracking()
+    -- Start a thread to track heist progress
+    Citizen.CreateThread(function()
+        while activeHeist do
+            -- Check player distance to objectives
+            CheckObjectiveProximity()
+            
+            -- Check for heist timeout if applicable
+            if activeHeist.timeout and GetGameTimer() > activeHeist.timeout then
+                TriggerEvent('qbx_heists:client:HeistFailed', 'Time limit exceeded')
+            end
+            
+            Citizen.Wait(1000) -- Check every second
+        end
+    end)
+end
+
+function StopHeistTracking()
+    -- This is handled by setting activeHeist to nil, which will stop the tracking thread
+end
+
+function CheckObjectiveProximity()
+    if not activeHeist or not activeHeist.stages[currentStage] then return end
+    
+    local playerPed = PlayerPedId()
+    local playerCoords = GetEntityCoords(playerPed)
+    
+    for _, marker in ipairs(objectiveMarkers) do
+        local distance = #(playerCoords - vector3(marker.position.x, marker.position.y, marker.position.z))
+        
+        -- If player is within 2.0 units of an objective marker
+        if distance < 2.0 then
+            -- Find the corresponding objective
+            for _, objective in ipairs(activeHeist.stages[currentStage].objectives) do
+                if objective.id == marker.objectiveId and objective.status ~= 'completed' then
+                    -- Display help text
+                    BeginTextCommandDisplayHelp('STRING')
+                    AddTextComponentSubstringPlayerName('Press ~INPUT_CONTEXT~ to ' .. objective.description)
+                    EndTextCommandDisplayHelp(0, false, true, 5000)
+                    
+                    -- Check for interaction
+                    if IsControlJustPressed(0, 38) then -- E key
+                        TriggerServerEvent('qbx_heists:server:StartObjective', activeHeist.id, currentStage, objective.id)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function CheckStageProgression()
+    if not activeHeist or not activeHeist.stages[currentStage] then return end
+    
+    local allCompleted = true
+    for _, objective in ipairs(activeHeist.stages[currentStage].objectives) do
+        if objective.status ~= 'completed' then
+            allCompleted = false
+            break
+        end
+    end
+    
+    if allCompleted then
+        TriggerServerEvent('qbx_heists:server:StageCompleted', activeHeist.id, currentStage)
+    end
+end
+
+-- Export helper functions
+exports('GetActiveHeist', function()
+    return activeHeist
+end)
+
+exports('GetCurrentStage', function()
+    return currentStage
+end)
+
+exports('IsInHeist', function()
+    return activeHeist ~= nil
+end) 
